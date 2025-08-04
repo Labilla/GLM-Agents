@@ -1,44 +1,16 @@
-# Python Bytecode und Caches
+ï»¿# Byte-compiled
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-*.pyd
-# Virtuelle Umgebungen
+
+# Virtualenv / venv
 venv/
-.venv/
-env/
 .env
-ENV/
-# Build- und Distributionsartefakte
-build/
-dist/
-*.egg-info/
-sdist/
-develop-eggs/
-eggs/
-lib/
-lib64/
-parts/
-var/
-wheels/
-*.egg
-pip-wheel-metadata/
-# Installations- und Konfigurationsdateien
-pip-selfcheck.json
-.installed.cfg
-# Log-Dateien
+.glm-agent/
+
+# Backup- & Log-Dateien
+*.bak
 *.log
-# Lokale Konfigurationsdateien für Editoren
-.vscode/
-.idea/
-.project
-.pydevproject
-.settings/
-# Betriebssystem-spezifische Dateien
-.DS_Store
-Thumbs.db
-# Sensible Daten (z.B. API-Keys)
-.env
-.env.*
-secrets.yml
-*.credential*
+
+# Artefakte
+artifacts/

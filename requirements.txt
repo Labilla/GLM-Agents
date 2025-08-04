@@ -1,0 +1,4 @@
+﻿httpx>=0.24
+textual>=0.43
+pytest>=8.0
+rich>=13.0
