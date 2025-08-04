@@ -1,0 +1,13 @@
+--- a/agent_bootstrap/bug_target.py
++++ b/agent_bootstrap/bug_target.py
+@@ -1,7 +1,9 @@
+ def parse_cfg(text):
+     out = {}
+     for line in text.splitlines():
+-        key, val = line.split('=', 1)
+-        out[key.strip()] = val.strip()
++        if '=' not in line:
++            continue
++        key, val = line.split('=', 1)
++        out[key.strip()] = val.strip()
+     return out

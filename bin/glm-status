@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+rep=$(ls -1t "$HOME/.glm-agent/artifacts"/report_*.json 2>/dev/null|head -n1)
+[ -f "$rep" ]||{ echo "Kein Report gefunden."; exit 1; }
+boot=$(jq -r .bootstrapped "$rep")
+tc=$(jq -r .tool_calls_total "$rep"); sr=$(jq -r .search_total "$rep"); rd=$(jq -r .read_total "$rep")
+ran=$(jq -r .tests_ran "$rep"); ok=$(jq -r .tests_ok "$rep"); ts=$(jq -r .timestamp "$rep")
+printf "Status (%s)\n" "${rep##*/}"
+printf " Bootstrapped: %s\n" "$([ "$boot" = true ]&&echo ✓||echo ✗)"
+printf " Tools:        %d (s:%d r:%d)\n" "$tc" "$sr" "$rd"
+printf " Tests:        %s (ran:%d)\n" "$([ "$ok" = true ]&&echo ✓||echo ✗)" "$ran"
+printf " Timestamp:    %s\n" "$ts"

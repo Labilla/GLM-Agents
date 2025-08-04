@@ -1,0 +1,15 @@
+--- a/agent_bootstrap/bug_target.py
++++ b/agent_bootstrap/bug_target.py
+@@ -1,10 +1,10 @@
+ def parse_config(file_path):
+     config = {}
+     with open(file_path, 'r') as f:
+         for line in f:
+-            if '=' in line:
+-                key, value = line.split('=', 1)
+-                config[key.strip()] = value.strip()
++            stripped = line.strip()
++            if stripped and '=' in stripped:
++                key, value = stripped.split('=', 1)
++                config[key.strip()] = value.strip()
+     return config

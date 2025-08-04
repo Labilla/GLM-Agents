@@ -1,0 +1,15 @@
+--- a/agent_bootstrap/bug_target.py
++++ b/agent_bootstrap/ Leerzeilen ignorieren
+@@ -1,7 +1,10 @@
+ def parse_cfg(text):
+     ausgabe = {}
+     for line in text.splitlines():
+-        # BUG: crasht bei Leerzeilen (split auf "")
+-        key, genau ein '='
++        # Leerzeilen und Zeilen ohne '=' werden übersprungen
++        if not line.strip() or '=' not in line:
++            continue
++        key, val = line.split('=', 1)
++        ausgabe[key.strip()] ungültige Zeilen
++        ausgabe[key.strip()] = val.strip()
+     return ausgabe

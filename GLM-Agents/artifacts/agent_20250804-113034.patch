@@ -1,0 +1,14 @@
+--- a/agent_bootstrap/bug_target.py
++++ b/agent_bootstrap/strip.py
+@@ -1,7 +1,7 @@
+ def parse_cfg(text):
+     BUG: crasht bei Leerzeilen (split auf "")
+     out = {}
+     BUG: crumbler
+     for line in text.splitlines():
+-        key, val = line.split('=', 1)
+-        out[key.strip()] nur Zeilen mit '='
++        if '=' in line:
++            key, val = line.split(' '=')
++            out[key.strip()] = val.strip()
+     return out

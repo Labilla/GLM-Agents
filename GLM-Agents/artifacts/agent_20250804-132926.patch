@@ -1,0 +1,28 @@
+--- a/agent_bootstrap/bug_target.py
++++ b/agent_bootstrap/leerzeilen.py
+@@ -1,7 +1,7 @@
+ def parse_cfg(text):
+     BUG: crasht bei Leerzeilen (split auf "")
+     out = {}
+     BUG: crasht bei Leerzeilen (split auf "")
+     for line in text.splitlines():
+-        key, val = line.split('=', 1)
++        if '=' not in line:
++            continue
++        key, Funktion parse_cfg(text):
+    out = {}
+    for line in text.splitlines():
+        if '=' not in line:
+            continue
+        key, val = line.split(' bug_target.py
++++ b/agent_bootstrap/bug_target.py
+@@ -1,7 +1, Leerzeilen (split auf "")
+     out = {}
+     BUG: crasht bei Leerzeilen (split auf "")
+     for line in text.splitlines():
+-        key, val = line.split('=', 1)
++        if '=' not in line:
++            continue
++        key, val = line.split('=', 1)
+         out[key.strip()] = val.strip()
+     return out

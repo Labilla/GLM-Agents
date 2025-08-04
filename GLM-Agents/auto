@@ -1,0 +1,19 @@
+{
+  "ok": false,
+  "model": "glm-4.5-flash",
+  "fallback_model": null,
+  "profile": "strict",
+  "tests": "unittest",
+  "max_steps": 6,
+  "used_retries": 0,
+  "search_total": 0,
+  "read_total": 0,
+  "diffs_applied": 0,
+  "diffs_failed": 0,
+  "code_runs": 0,
+  "tests_ran": null,
+  "tests_ok": null,
+  "bootstrapped": false,
+  "duration_sec": 72.841,
+  "timestamp": "20250804-082211"
+}

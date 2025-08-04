@@ -1,0 +1,1199 @@
+
+# --- metrics init (module-level, used by handle_tool_block) ---
+session_ok = False
+used_retries = 0
+tool_calls_total = 0
+search_total = 0
+read_total = 0
+diffs_applied = 0
+diffs_failed = 0
+code_runs = 0
+tests_ran = 0
+tests_ok = False
+did_bootstrap = False
+
+import os
+import configparser, sys, json, time, tempfile, subprocess, shlex, re, random, pathlib, shutil, configparser
+from typing import List, Dict, Any, Optional, Tuple
+import httpx
+import atexit
+
+# =========================
+#   Globale Konfiguration
+# =========================
+API_BASE = os.environ.get("GLM_API_BASE", "https://api.z.ai/api/paas/v4/chat/completions")
+DEFAULT_MODEL = os.environ.get("GLM_MODEL", "glm-4.5-flash")
+API_KEY  = os.environ.get("ZAI_API_KEY", "")
+
+if not API_KEY:
+    print("[ERR] Kein API-Key (ZAI_API_KEY) im Environment gefunden.", file=sys.stderr)
+    sys.exit(2)
+
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json",
+    "Accept-Language": os.environ.get("ACCEPT_LANGUAGE","de-DE,de;q=0.9,en;q=0.8")
+}
+
+# =========================
+#   Hilfsfunktionen
+# =========================
+def timeout_obj(connect=10.0, read=90.0, write=30.0, pool=90.0):
+    return httpx.Timeout(timeout=None, connect=connect, read=read, write=write, pool=pool)
+
+def shorten(txt: str, limit: int = 1200) -> str:
+    if not txt: return ""
+    if len(txt) <= limit: return txt
+    return txt[:limit] + f"\n[... gekürzt, {len(txt)-limit} weitere Zeichen]"
+
+# ANSI Farben
+ANSI_OK   = "\033[32m"
+ANSI_INFO = "\033[36m"
+ANSI_WARN = "\033[33m"
+ANSI_ERR  = "\033[31m"
+ANSI_RST  = "\033[0m"
+
+def badge(kind: str, msg: str) -> str:
+    if kind=="OK":   return f"{ANSI_OK}[OK]{ANSI_RST} {msg}"
+    if kind=="INFO": return f"{ANSI_INFO}[INFO]{ANSI_RST} {msg}"
+    if kind=="WARN": return f"{ANSI_WARN}[WARN]{ANSI_RST} {msg}"
+    if kind=="ERR":  return f"{ANSI_ERR}[ERR]{ANSI_RST} {msg}"
+    if kind=="BOOT": return f"{ANSI_INFO}[BOOTSTRAP]{ANSI_RST} {msg}"
+    if kind=="PATCH":return f"{ANSI_INFO}[PATCH]{ANSI_RST} {msg}"
+    return msg
+
+def now_ts() -> str:
+    return time.strftime("%Y%m%d-%H%M%S")
+
+def ensure_dir(p: str) -> str:
+    pathlib.Path(p).mkdir(parents=True, exist_ok=True)
+    return p
+
+def write_file(path: str, data: str, mode: str = "w", encoding: str = "utf-8"):
+    with open(path, mode, encoding=encoding) as f:
+        f.write(data)
+
+def append_file(path: str, data: str, encoding: str = "utf-8"):
+    with open(path, "a", encoding=encoding) as f:
+        f.write(data)
+
+def log_line(logfile: Optional[str], line: str):
+    if logfile:
+        append_file(logfile, f"[{now_ts()}] {line}\n")
+
+# =========================
+#   Workspace & Git
+# =========================
+def run_cmd(cmd: List[str], cwd: Optional[str], logfile: Optional[str], timeout: int = 120) -> Tuple[int,str,str]:
+    start = time.time()
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    dur = round(time.time()-start,3)
+    out, err = p.stdout, p.stderr
+    log_line(logfile, f"$ {' '.join(cmd)} (rc={p.returncode}, {dur}s)\nstdout:\n{shorten(out)}\nstderr:\n{shorten(err)}")
+    return p.returncode, out, err
+
+def prepare_workspace(workspace: Optional[str], git_url: Optional[str], branch: Optional[str], logfile: Optional[str], force_clone: bool=False) -> str:
+    if not workspace:
+        workspace = os.path.join(os.environ.get("HOME","/tmp"), ".glm-agent", "workspace")
+    ensure_dir(workspace)
+    if git_url:
+        if force_clone:
+            repo_sub = os.path.join(workspace, f"repo_{time.strftime('%Y%m%d-%H%M%S')}")
+            ensure_dir(repo_sub)
+            cmd = ["git","clone","--depth","1"] + (["-b",branch] if branch else []) + [git_url, repo_sub]
+            run_cmd(cmd, cwd=None, logfile=logfile, timeout=180)
+            print(badge("INFO", f"Klon in frischem Unterordner: {repo_sub}"))
+            return repo_sub
+        git_dir = os.path.join(workspace, ".git")
+        if not any(os.scandir(workspace)):
+            cmd = ["git","clone","--depth","1"] + (["-b",branch] if branch else []) + [git_url, workspace]
+            run_cmd(cmd, cwd=None, logfile=logfile, timeout=180)
+        elif os.path.isdir(git_dir):
+            run_cmd(["git","-C",workspace,"pull","--ff-only"], cwd=None, logfile=logfile, timeout=120)
+        else:
+            repo_sub = os.path.join(workspace, "repo")
+            ensure_dir(repo_sub)
+            if not any(os.scandir(repo_sub)):
+                cmd = ["git","clone","--depth","1"] + (["-b",branch] if branch else []) + [git_url, repo_sub]
+                run_cmd(cmd, cwd=None, logfile=logfile, timeout=180)
+            else:
+                run_cmd(["git","-C",repo_sub,"pull","--ff-only"], cwd=None, logfile=logfile, timeout=120)
+            workspace = repo_sub
+    return workspace
+
+# =========================
+#   System-Prompt
+# =========================
+DEFAULT_SYSTEM_PROMPT = (
+    "Du bist ein strenger, professioneller Coding-Agent. "
+    "Arbeite iterativ (Plan -> Code -> Run -> Inspect). "
+    "ANTWORTE AUSSCHLIESSLICH ALS EINZIGEN ```python```-BLOCK (keine Erklärungen außerhalb). "
+    "Der Block MUSS enthalten: (1) Implementierung, (2) MINIMALE UNIT-TESTS, (3) einen kurzen Testrun am Ende.\n"
+    "Richtlinien: 1) klein & sicher, 2) Edge-Case-Tests, 3) deterministische Ausgaben, "
+    "4) schrittweise Verbesserungen, 5) bei Fehlern EIN minimaler Patch als ```python```-Block.\n"
+    "Wenn du stattdessen einen **Unified Diff** erzeugst, gib einen einzigen ```diff```-Block "
+    "im Standardformat mit ---/+++/@@ Hunks aus, der sauber auf das Repo im Workspace anwendbar ist.\n"
+    "Wenn du Code sichten oder Dateien im Workspace durchsuchen musst, gib GENAU EINEN ```tool```-Block mit JSON aus (niemals ```python``` dafür verwenden!), "
+    "z. B. {\"action\":\"search\",\"q\":\"pattern\",\"path\":\"optional/subdir\",\"max\":50} "
+    "oder {\"action\":\"read\",\"path\":\"relativer/pfad.py\",\"from\":1,\"to\":200}. "
+    "Keine Erklärungen außerhalb des Blocks."
+)
+
+# =========================
+#   Regex-Erkennung & Sanitizer
+# =========================
+PY_BLOCK_RE   = re.compile(r"```(?:python|py)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+DIFF_BLOCK_RE = re.compile(r"```diff\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+TOOL_BLOCK_RE = re.compile(r"```tool\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+UNIFIED_DIFF_HEADER_RE = re.compile(r"^---\s+.*\n\+\+\+\s+.*\n", re.MULTILINE)
+ANY_CODE_RE  = re.compile(r"```[a-zA-Z0-9_-]*\s*(.*?)```", re.DOTALL)
+
+META_TAG_RE = re.compile(r"<\s*think\s*>.*?<\s*/\s*think\s*>", re.DOTALL | re.IGNORECASE)
+ANY_TAG_RE  = re.compile(r"<[^>]+>")
+
+def strip_meta(text: str) -> str:
+    if not text: return ""
+    text = META_TAG_RE.sub("", text)
+    text = ANY_TAG_RE.sub("", text)
+    return text
+
+def _looks_like_tool_json(txt: str) -> bool:
+    t = (txt or "").strip()
+    if not (t.startswith("{") and t.endswith("}")):
+        return False
+    try:
+        d = json.loads(t)
+        if not isinstance(d, dict):
+            return False
+        act = (d.get("action") or "").lower().strip()
+        return act in {"search","read"}
+    except Exception:
+        return False
+
+def extract_clean_python_block(text: str) -> tuple[Optional[str], Optional[str]]:
+    text = strip_meta(text or "")
+    blocks = list(re.finditer(r"```(?:python|py)?\s*(.*?)```", text, re.DOTALL|re.IGNORECASE))
+    if len(blocks) != 1:
+        return None, f"erwartet 1 Codeblock, gefunden {len(blocks)}"
+    code = blocks[0].group(1)
+    # Verhindere Tool-JSON im python-Fence
+    if _looks_like_tool_json(code):
+        return None, 'Tool-JSON im python-Codeblock erkannt – gib ```tool``` aus, nicht ```python```.'
+    # entferne verschachtelte Fences
+    code = re.sub(r"```.*?```", "", code, flags=re.DOTALL)
+    code = strip_meta(code).replace("\r", "")
+    try:
+        compile(code, "<agent>", "exec")
+    except SyntaxError as e:
+        return None, f"Syntaxfehler: {e}"
+    return code.strip(), None
+
+ALLOWED_TOOL_ACTIONS = {"search","read"}
+ALLOWED_TOOL_KEYS = {
+    "search": {"action","q","path","max"},
+    "read":   {"action","path","from","to"},
+}
+
+def try_extract_tool_json(content: str):
+    if not content: return None
+    # 1) expliziter tool-Block
+    m = TOOL_BLOCK_RE.search(content)
+    candidates = []
+    if m:
+        candidates.append(m.group(1).strip())
+    # 2) beliebiger Code-Fence
+    for m2 in ANY_CODE_RE.finditer(content):
+        raw = (m2.group(1) or "").strip()
+        if raw and raw not in candidates:
+            candidates.append(raw)
+    # 3) nacktes JSON
+    if "{" in content and "}" in content:
+        start = content.find("{"); end = content.rfind("}")
+        if 0 <= start < end:
+            raw = content[start:end+1].strip()
+            if raw and raw not in candidates:
+                candidates.append(raw)
+    for raw in candidates:
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict): continue
+            action = (data.get("action") or "").strip().lower()
+            if action not in ALLOWED_TOOL_ACTIONS: continue
+            allowed = ALLOWED_TOOL_KEYS[action]
+            if any(k not in allowed for k in data.keys()): continue
+            return data
+        except Exception:
+            continue
+    return None
+
+# =========================
+#   Health-Ping
+# =========================
+def timeout_wrap(connect_to: float, read_to: float):
+    return timeout_obj(connect=connect_to, read=read_to)
+
+def health_ping(model: str, connect_to: float, read_to: float, attempts: int = 3, strict: bool = False, logfile: Optional[str]=None) -> None:
+    payload = {"model": model, "messages": [{"role":"system","content":"You are a health-check."},{"role":"user","content":"ping"}], "max_tokens": 8, "temperature": 0.0}
+    for i in range(attempts):
+        try:
+            with httpx.Client(timeout=timeout_wrap(connect_to, read_to)) as client:
+                r = client.post(API_BASE, headers=HEADERS, json=payload)
+                if r.status_code == 429:
+                    ra = r.headers.get("Retry-After")
+                    wait = int(ra) if (ra and ra.isdigit()) else (2**i)
+                    log_line(logfile, f"Health 429 -> sleep {wait}s")
+                    time.sleep(wait); continue
+                r.raise_for_status()
+                _ = r.json()["choices"][0]["message"]["content"]
+                log_line(logfile, "Health OK")
+                return
+        except (httpx.TimeoutException, httpx.HTTPError) as e:
+            sleep = (2**i) + random.uniform(0,0.5)
+            log_line(logfile, f"Health-Fail {i+1}/{attempts}: {e} -> retry {sleep:.1f}s")
+            time.sleep(sleep)
+    if strict:
+        log_line(logfile, "Health endgültig fehlgeschlagen (strict).")
+        print("[ERR] Health-Ping fehlgeschlagen.", file=sys.stderr)
+        sys.exit(11)
+    else:
+        log_line(logfile, "Health fehlgeschlagen (weiter).")
+        print("[WARN] Health-Ping fehlgeschlagen – fahre fort.")
+
+# =========================
+#   HTTP Chat (+ Fallback)
+# =========================
+def chat_non_stream(model: str, messages: List[Dict[str,Any]], temperature: float, max_tokens: int,
+                    connect_to: float, read_to: float, logfile: Optional[str], fallback_model: Optional[str]=None) -> Dict[str,Any]:
+    payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    try:
+        with httpx.Client(timeout=timeout_wrap(connect_to, read_to)) as client:
+            r = client.post(API_BASE, headers=HEADERS, json=payload)
+            r.raise_for_status()
+            return r.json()
+    except (httpx.TimeoutException, httpx.HTTPError) as e:
+        if fallback_model:
+            log_line(logfile, f"Non-stream call failed on {model}: {e} -> fallback {fallback_model}")
+            payload["model"] = fallback_model
+            with httpx.Client(timeout=timeout_wrap(connect_to, read_to)) as client:
+                r = client.post(API_BASE, headers=HEADERS, json=payload)
+                r.raise_for_status()
+                return r.json()
+        raise
+
+def chat_stream(model: str, messages: List[Dict[str,Any]], temperature: float, max_tokens: int,
+                connect_to: float, read_to: float, logfile: Optional[str]) -> Optional[str]:
+    payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens, "stream": True}
+    try:
+        with httpx.Client(timeout=timeout_wrap(connect_to, read_to)) as client:
+            with client.stream("POST", API_BASE, headers=HEADERS, json=payload) as r:
+                ctype = r.headers.get("Content-Type","")
+                if "text/event-stream" not in ctype:
+                    return None
+                assembled = []
+                print(f"[STREAM] ", end="", flush=True)
+                for line in r.iter_lines():
+                    if not line: continue
+                    if isinstance(line, bytes):
+                        try: line = line.decode("utf-8", errors="ignore")
+                        except Exception: continue
+                    if not line.startswith("data:"): continue
+                    data = line[5:].strip()
+                    if data == "[DONE]": break
+                    try: chunk = json.loads(data)
+                    except Exception: continue
+                    choices = chunk.get("choices") or []
+                    if not choices: continue
+                    delta = choices[0].get("delta") or {}
+                    piece = delta.get("content")
+                    if piece:
+                        assembled.append(piece); print(piece, end="", flush=True)
+                print()
+                return "".join(assembled)
+    except Exception as e:
+        log_line(logfile, f"Stream-Fehler: {e}")
+        return None
+
+# =========================
+#   Python lokal ausführen
+# =========================
+def run_python(code: str, workspace: str, artifacts: Optional[str],
+               timeout_sec: int, cpu_seconds: Optional[int], mem_limit_mb: Optional[int],
+               no_network: bool, logfile: Optional[str], step_idx: int, test_runner: str) -> Dict[str,Any]:
+    ensure_dir(workspace)
+    if artifacts: ensure_dir(artifacts)
+
+    script_name = f"agent_step_{step_idx}.py"
+    script_path = os.path.join(workspace, script_name)
+    write_file(script_path, code)
+    if artifacts:
+        shutil.copy2(script_path, os.path.join(artifacts, f"{now_ts()}_{script_name}"))
+
+    limits = []
+    if cpu_seconds and cpu_seconds > 0:
+        limits += [f"ulimit -t {int(cpu_seconds)}"]
+    if mem_limit_mb and mem_limit_mb > 0:
+        limits += [f"ulimit -v {int(mem_limit_mb*1024)}"]
+    if no_network:
+        limits += ["unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY"]
+
+    limit_cmd = " && ".join(limits) + (" && " if limits else "")
+    cmd = f"bash -lc {shlex.quote(limit_cmd + f'python3 -I {shlex.quote(script_name)}')}"
+
+    env = {"PYTHONWARNINGS":"ignore","PYTHONDONTWRITEBYTECODE":"1"}
+    start=time.time()
+    try:
+        p = subprocess.run(cmd, shell=True, cwd=workspace, env=env, capture_output=True, text=True, timeout=timeout_sec)
+        dur=round(time.time()-start,3)
+        result = {"ok": p.returncode==0, "returncode": p.returncode,
+                  "stdout": p.stdout[-10000:], "stderr": p.stderr[-10000:], "duration_sec": dur}
+        log_line(logfile, f"RUN {script_name} rc={p.returncode} dur={dur}s\nSTDOUT:\n{shorten(p.stdout)}\nSTDERR:\n{shorten(p.stderr)}")
+        return result
+    except subprocess.TimeoutExpired as e:
+        result={"ok":False,"returncode":124,"stdout":(e.stdout or ""),"stderr":"TIMEOUT","duration_sec":timeout_sec}
+        log_line(logfile, f"RUN TIMEOUT {script_name} after {timeout_sec}s")
+        return result
+
+def print_exec_summary(result: Dict[str, Any]):
+    print("\n[EXEC-ERGEBNIS] --------------------")
+    print(f"Returncode: {result['returncode']} | Dauer: {result['duration_sec']}s")
+    out = (result.get("stdout") or "").rstrip()
+    err = (result.get("stderr") or "").rstrip()
+    if out: print("\nSTDOUT:\n" + out)
+    if err: print("\nSTDERR:\n" + err)
+    print("--------------------\n")
+
+def is_failure(result: Dict[str, Any]) -> bool:
+    if not result.get("ok", False): return True
+    err = (result.get("stderr") or "").lower()
+    if "traceback" in err or " error" in err or "exception" in err: return True
+    out = (result.get("stdout") or "").lower()
+    if "assertionerror" in err or "failed" in out or "errors=" in out: return True
+    return False
+
+# =========================
+#   Diff-/Patch-Flow
+# =========================
+def have_unified_diff(text: str) -> bool:
+    if not text: return False
+    if DIFF_BLOCK_RE.search(text): return True
+    return bool(UNIFIED_DIFF_HEADER_RE.search(text))
+
+def extract_unified_diff(text: str) -> Optional[str]:
+    m = DIFF_BLOCK_RE.search(text or "")
+    if m: return m.group(1).strip()
+    uh = UNIFIED_DIFF_HEADER_RE.search(text or "")
+    if uh:
+        start = uh.start()
+        return (text or "")[start:].strip()
+    return None
+
+def apply_unified_diff(diff_text: str, workspace: str, artifacts: Optional[str], logfile: Optional[str], dry_run: bool=False) -> Tuple[bool,str]:
+    ensure_dir(workspace)
+    if artifacts: ensure_dir(artifacts)
+    patch_path = os.path.join(workspace, f"agent_{now_ts()}.patch")
+    write_file(patch_path, diff_text)
+    if artifacts:
+        shutil.copy2(patch_path, os.path.join(artifacts, os.path.basename(patch_path)))
+
+    if dry_run:
+        rc0, out0, err0 = run_cmd(["patch","-p0","--dry-run","-i",patch_path], cwd=workspace, logfile=logfile, timeout=120)
+        if rc0 == 0: return True, "dry-run ok (patch -p0)"
+        rc1, out1, err1 = run_cmd(["git","apply","--check",patch_path], cwd=workspace, logfile=logfile, timeout=120)
+        if rc1 == 0: return True, "dry-run ok (git apply --check)"
+        return False, f"dry-run failed:\npatch:\n{err0}\n\ngit apply:\n{err1}"
+
+    rc, out, err = run_cmd(["patch","-p0","-i",patch_path], cwd=workspace, logfile=logfile, timeout=120)
+    if rc == 0:
+        return True, out or "patch applied with patch -p0"
+    rc2, out2, err2 = run_cmd(["git","apply",patch_path], cwd=workspace, logfile=logfile, timeout=120)
+    if rc2 == 0:
+        return True, out2 or "patch applied with git apply"
+    return False, f"patch failed:\npatch:\n{err}\n\ngit apply:\n{err2}"
+
+# =========================
+#   Tool-Blöcke (search/read)
+# =========================
+def is_safe_relpath(base: str, p: str) -> bool:
+    base = os.path.realpath(base)
+    target = os.path.realpath(os.path.join(base, p))
+    return target.startswith(base + os.sep) or (target == base)
+
+def handle_tool_block(tool_json: str, workspace: str, logfile: Optional[str]) -> str:
+    global search_total, read_total, tool_calls_total
+    try:
+        data = json.loads(tool_json)
+    except Exception:
+        return "Tool-Fehler: Ungültiges JSON."
+
+    act = (data.get("action") or "").lower().strip()
+    if act == "search":
+        search_total += 1
+        tool_calls_total += 1
+        log_line(logfile, "[TOOL] search invoked; search_total=%s; tool_calls_total=%s" % (search_total, tool_calls_total))
+        # -- sync metrics -> __glm_exit_ctx (idempotent) --
+        try:
+            _g = globals()
+            _ctx = _g.setdefault('__glm_exit_ctx', {})
+            _ctx['tool_calls_total'] = int(tool_calls_total)
+            _ctx['search_total'] = int(search_total)
+            _ctx['read_total']   = int(read_total)
+        except Exception:
+            pass
+
+        print(badge("INFO","[TOOL] search invoked"))
+
+        q = data.get("q") or ""
+        sub = data.get("path") or ""
+        limit = int(data.get("max") or 50)
+        if not q: return "Tool-Fehler: 'q' fehlt."
+        base = workspace
+        if sub:
+            if not is_safe_relpath(workspace, sub):
+                return "Tool-Fehler: unsicherer Pfad."
+            base = os.path.join(workspace, sub)
+        cmd = ["bash","-lc",
+               "command -v rg >/dev/null 2>&1 "
+               "&& rg -n --no-heading --hidden --glob '!.git' --glob '!agent_step_*.py' " + shlex.quote(q) + f" | head -n {limit} "
+               "|| grep -REn --exclude-dir=.git --exclude='agent_step_*.py' " + shlex.quote(q) + " . | head -n " + str(limit)]
+        rc, out, err = run_cmd(cmd, cwd=base, logfile=logfile, timeout=30)
+        if rc not in (0,1):
+            return f"Tool-Fehler: search rc={rc}: {shorten(err)}"
+        log_line(logfile, "[TOOL] SEARCH-ERGEBNIS returned")
+        return "SEARCH-ERGEBNIS:\n" + (shorten(out) if out else "(keine Treffer)")
+            
+    elif act == "read":
+        read_total += 1
+        tool_calls_total += 1
+        log_line(logfile, "[TOOL] read invoked; read_total=%s; tool_calls_total=%s" % (read_total, tool_calls_total))
+        # -- sync metrics -> __glm_exit_ctx (idempotent) --
+        try:
+            _g = globals()
+            _ctx = _g.setdefault('__glm_exit_ctx', {})
+            _ctx['tool_calls_total'] = int(tool_calls_total)
+            _ctx['search_total'] = int(search_total)
+            _ctx['read_total']   = int(read_total)
+        except Exception:
+            pass
+
+        print(badge("INFO","[TOOL] read invoked"))
+
+        path = data.get("path") or ""
+        if not path: return "Tool-Fehler: 'path' fehlt."
+        if not is_safe_relpath(workspace, path): return "Tool-Fehler: unsicherer Pfad."
+        abs_p = os.path.join(workspace, path)
+        if not os.path.exists(abs_p): return "Tool-Fehler: Datei nicht gefunden."
+        f = int(data.get("from") or 1); t = int(data.get("to") or (f+199))
+        f = max(f,1); t = max(t,f)
+        try:
+            with open(abs_p, "r", encoding="utf-8", errors="replace") as fp:
+                lines = fp.readlines()
+            chunk = "".join(lines[f-1:t])
+            log_line(logfile, "[TOOL] READ-ERGEBNIS returned")
+            return f"READ-ERGEBNIS {path}:{f}-{t}:\n" + shorten(chunk, 2000)
+        except Exception as e:
+            return f"Tool-Fehler: read: {e}"
+    else:
+        return "Tool-Fehler: Unbekannte Aktion."
+
+# =========================
+#   Tests-Runner Mgmt
+# =========================
+def detect_test_runner(workspace: str) -> str:
+    candidates = [
+        os.path.join(workspace, "pytest.ini"),
+        os.path.join(workspace, "conftest.py"),
+        os.path.join(workspace, "tox.ini"),
+        os.path.join(workspace, "pyproject.toml"),
+        os.path.join(workspace, "tests"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            if c.endswith("pyproject.toml"):
+                try:
+                    txt = open(c,"r",encoding="utf-8",errors="ignore").read().lower()
+                    if "[tool.pytest.ini_options]" in txt:
+                        return "pytest"
+                except Exception:
+                    pass
+            else:
+                if os.path.isdir(c) and os.path.basename(c)=="tests":
+                    return "pytest"
+                if os.path.isfile(c):
+                    base = os.path.basename(c).lower()
+                    if base in ("pytest.ini","conftest.py","tox.ini"):
+                        return "pytest"
+    return "unittest"
+def ensure_pytest_installed(logfile: Optional[str]) -> None:
+    try:
+        import pytest  # noqa
+        return
+    except Exception:
+        rc, out, err = run_cmd([sys.executable,"-m","pip","install","-q","pytest==8.*"], cwd=None, logfile=logfile, timeout=180)
+        if rc != 0:
+            print("[WARN] pytest-Installation fehlgeschlagen – fallback auf unittest.")
+            log_line(logfile, f"pytest install failed: {err}")
+
+def tests_prompt_fragment(test_runner: str) -> str:
+    if test_runner == "pytest":
+        return ("Nutze **pytest**-Konventionen (Funktionen `test_*`, `assert`), und führe am Ende `print(\"PYTEST_OK\")` aus.")
+    return ("Nutze **unittest** (TestCase-Klasse + `unittest.main()`), und sorge für kurze, klare Ausgabe.")
+
+# =========================
+#   Config laden/schreiben
+# =========================
+CFG_PATH = os.path.join(os.environ.get("HOME","/data/data/com.termux/files/home"), ".glm-agent", "config.ini")
+
+def load_config() -> dict:
+    out = {}
+    if os.path.exists(CFG_PATH):
+        cp = configparser.ConfigParser()
+        cp.read(CFG_PATH, encoding="utf-8")
+        if "agent" in cp:
+            out = dict(cp["agent"])
+    return out
+
+def write_default_config():
+    ensure_dir(os.path.dirname(CFG_PATH))
+    tpl = """[agent]
+model = glm-4.5-flash
+fallback_model =
+profile = strict
+tests = unittest
+max_steps = 6
+retries = 1
+no_stream = false
+no_health = false
+health_strict = false
+connect_timeout = 10.0
+read_timeout = 90.0
+exec_timeout = 60
+cpu_seconds = 0
+mem_limit = 0
+no_network = true
+workspace =
+git =
+branch =
+artifacts = ~/.glm-agent/artifacts
+logfile = ~/.glm-agent/agent.log
+max_history_chars = 16000
+json_report =
+dry_run_patch = false
+"""
+    write_file(CFG_PATH, tpl)
+
+# =========================
+#   Hauptprogramm
+# =========================
+def main():
+    global __glm_exit_ctx
+    __glm_exit_ctx = {}
+    # --- Metrics: müssen VOR erster Nutzung existieren ---
+    session_ok = False
+    used_retries = 0
+    tool_calls_total = 0
+    search_total = 0
+    read_total = 0
+    consecutive_nohit = 0
+    diffs_applied = 0
+    diffs_failed = 0
+    code_runs = 0
+    tests_ok = None
+    tests_ran = None
+    did_bootstrap = False
+    try:
+        try:
+            atexit.register(_emit_json_report_ci_on_exit)
+        except NameError:
+            pass
+    except NameError:
+        pass
+    import argparse
+    ap = argparse.ArgumentParser(description="GLM-4.5 agentisches Coding — Workspace, Diffs, Tools, Tests, Limits, Logging, Profiles, CI")
+    # init/config
+    ap.add_argument("--init", action="store_true", help="Lege ~/.glm-agent/config.ini mit Defaults an.")
+    ap.add_argument("--config", default=None, help="Alternative Config-Datei (INI).")
+    # Kern
+    ap.add_argument("--system", default=DEFAULT_SYSTEM_PROMPT)
+    ap.add_argument("--taskfile", default=None, help="Aufgabe aus Datei lesen (überschreibt CLI-Task).")
+    ap.add_argument("--max-steps", type=int, default=None)
+    ap.add_argument("--temperature", type=float, default=0.2)
+    ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--model", default=None, help="Modell-Override (z. B. glm-4.5).")
+    ap.add_argument("--fallback-model", default=None, help="Fallback-Modell für Non-Stream-Calls.")
+    # Streaming / Health
+    ap.add_argument("--no-stream", action="store_true")
+    ap.add_argument("--no-health", action="store_true")
+    ap.add_argument("--health-strict", action="store_true")
+    ap.add_argument("--connect-timeout", type=float, default=None)
+    ap.add_argument("--read-timeout", type=float, default=None)
+    # Workspace & Repos
+    ap.add_argument("--workspace", default=None)
+    ap.add_argument("--git", default=None)
+    ap.add_argument("--branch", default=None)
+    ap.add_argument("--require-tool-first", action="store_true", help="Vor jedem diff/python mindestens einen search/read-Tool-Call erzwingen.")
+    ap.add_argument("--force-clone", action="store_true", help="Immer in frischen Unterordner repo_<ts> klonen.")
+    # Artefakte & Logs
+    ap.add_argument("--artifacts", default=None)
+    ap.add_argument("--logfile", default=None)
+    # Tests
+    ap.add_argument("--tests", choices=["unittest","pytest","auto"], default=None)
+    # Limits
+    ap.add_argument("--exec-timeout", type=int, default=None)
+    ap.add_argument("--cpu-seconds", type=int, default=None)
+    ap.add_argument("--mem-limit", type=int, default=None)
+    ap.add_argument("--no-network", action="store_true")
+    # History/Guard
+    ap.add_argument("--max-history-chars", type=int, default=None)
+    # Profile
+    ap.add_argument("--profile", choices=["strict","creative"], default=None)
+    ap.add_argument("--retries", type=int, default=None, help="Auto-Retry bei Fail-fast (minimale Änderung)")
+    # CI/Reports
+    ap.add_argument("--ci", action="store_true", help="CI-Modus: strict, non-stream, health-strict, JSON-Report auto.")
+    ap.add_argument("--json-report", default=None, help="Pfad für JSON-Report (Session-Status).")
+    ap.add_argument("--bootstrap-missing-target", action="store_true", help="Bei ausbleibenden Treffern ein minimales fehlerhaftes Ziel + Tests erzeugen und Diff-Fix anfordern.")
+    ap.add_argument("--bootstrap-threshold", type=int, default=2, help="Anzahl aufeinanderfolgender Such-NoHits bis Bootstrap greift.")
+    ap.add_argument("--bootstrap-kind", default="parser-empty-lines", help="Bootstrap-Typ (vordefiniert: parser-empty-lines).")
+    ap.add_argument("--bootstrap-after-steps", type=int, default=3, help="Wenn nach N Schritten noch kein Tool-Call stattfand, Bootstrap auslösen (falls --bootstrap-missing-target).")
+    # Patch safety
+    ap.add_argument("--dry-run-patch", action="store_true", help="Unified-Diff nur prüfen, nicht anwenden.")
+    # Auto-continue
+    ap.add_argument("--no-auto-continue", action="store_true", help="Bei fehlendem Codeblock nicht automatisch nachfassen.")
+    ap.add_argument("task", nargs="*")
+
+    args = ap.parse_args()
+
+    globals()['args']=args
+    # --- SAFE cfg bootstrap: vor JEDEM cfg.get(...) verfügbar ---
+    cfg = {}
+    globals()['cfg']=cfg
+    try:
+        import os, configparser
+        cfg_path = os.path.expanduser("~/.glm-agent/config.ini")
+        if os.path.exists(cfg_path):
+            cp = configparser.ConfigParser()
+            cp.read(cfg_path, encoding="utf-8")
+            for sec in cp.sections():
+                for k, v in cp.items(sec):
+                    cfg[k] = v
+    except Exception:
+        cfg = {}
+    try:
+        __glm_exit_ctx['cfg'] = cfg
+    except Exception:
+        pass
+    __glm_exit_ctx['args'] = args
+
+    # Config laden
+    cfg_path = args.config or CFG_PATH
+    try:
+        try:
+            __glm_exit_ctx['cfg'] = cfg
+        except NameError:
+            pass
+    except NameError:
+        __glm_exit_ctx['cfg'] = globals().get('cfg', {})
+    if args.init:
+        write_default_config()
+        print(f"[OK] Config erstellt: {CFG_PATH}")
+        sys.exit(0)
+
+    def cfg_get_bool(key: str, default: bool) -> bool:
+        v = cfg.get(key)
+        if v is None: return default
+        return str(v).lower() in ("1","true","yes","on")
+
+    # Werte zusammenführen: CLI > Config > Defaults
+    model = args.model or cfg.get("model") or DEFAULT_MODEL
+    fallback_model = args.fallback_model or cfg.get("fallback_model") or None
+
+    profile = args.profile or cfg.get("profile") or None
+    workspace_hint = args.workspace or cfg.get("workspace") or os.getcwd()
+    tests = args.tests or cfg.get("tests") or "unittest"
+    if tests == "auto":
+        tests = detect_test_runner(workspace_hint)
+        print(badge("INFO", f"Auto-Tests erkannt: {tests}"))
+
+    max_steps = args.max_steps if args.max_steps is not None else int(cfg.get("max_steps", "6"))
+    retries = args.retries if args.retries is not None else int(cfg.get("retries", "1"))
+
+    no_stream = args.no_stream or cfg_get_bool("no_stream", False)
+    no_health = args.no_health or cfg_get_bool("no_health", False)
+    health_strict = args.health_strict or cfg_get_bool("health_strict", False)
+
+    connect_timeout = args.connect_timeout if args.connect_timeout is not None else float(cfg.get("connect_timeout", "10.0"))
+    read_timeout = args.read_timeout if args.read_timeout is not None else float(cfg.get("read_timeout", "90.0"))
+
+    exec_timeout = args.exec_timeout if args.exec_timeout is not None else int(cfg.get("exec_timeout", "60"))
+    cpu_seconds = args.cpu_seconds if args.cpu_seconds is not None else int(cfg.get("cpu_seconds", "0"))
+    mem_limit = args.mem_limit if args.mem_limit is not None else int(cfg.get("mem_limit", "0"))
+    no_network = args.no_network or cfg_get_bool("no_network", True)
+
+    workspace = args.workspace or cfg.get("workspace") or None
+    git_url = args.git or cfg.get("git") or None
+    branch = args.branch or cfg.get("branch") or None
+
+    artifacts = args.artifacts or cfg.get("artifacts") or None
+    logfile = args.logfile or cfg.get("logfile") or None
+
+    max_history_chars = args.max_history_chars if args.max_history_chars is not None else int(cfg.get("max_history_chars","16000"))
+
+    json_report = args.json_report or cfg.get("json_report") or None
+    dry_run_patch = args.dry_run_patch or cfg_get_bool("dry_run_patch", False)
+
+    # Profile anwenden
+    temperature = args.temperature
+    max_tokens = args.max_tokens
+    if profile == "strict":
+        temperature = min(temperature, 0.1)
+        max_tokens = min(max_tokens, 1024)
+        no_stream = True if args.ci or no_stream else no_stream
+    elif profile == "creative":
+        temperature = max(temperature, 0.6)
+        max_tokens = max(max_tokens, 2048)
+
+    # CI-Modus Defaults
+    if args.ci:
+        no_stream = True
+        health_strict = True
+        profile = "strict"
+        if not json_report:
+            ensure_dir(artifacts or os.path.join(os.environ.get("HOME","/tmp"), ".glm-agent", "artifacts"))
+            json_report = os.path.join(artifacts or os.path.join(os.environ.get("HOME","/tmp"), ".glm-agent", "artifacts"),
+                                       f"report_{now_ts()}.json")
+
+    # Workspace/Git vorbereiten
+    workspace = prepare_workspace(workspace, git_url, branch, logfile, force_clone=args.force_clone)
+
+    # pytest ggf. installieren
+    if tests == "pytest":
+        ensure_pytest_installed(logfile)
+
+    # Health-Ping
+    if not no_health:
+        health_ping(model, connect_timeout, read_timeout, attempts=3, strict=health_strict, logfile=logfile)
+
+    # Task bestimmen
+    if args.taskfile:
+        with open(args.taskfile, "r", encoding="utf-8") as f:
+            task = f.read()
+    else:
+        task = " ".join(args.task) if args.task else input("Aufgabe: ").strip()
+    if not task:
+        print("[ERR] Keine Aufgabe angegeben.", file=sys.stderr); sys.exit(2)
+
+    # Systemprompt bauen (CI-Regeln nur innerhalb main)
+    system_prompt = args.system + "\n" + tests_prompt_fragment(tests)
+    if args.ci:
+        system_prompt += (
+            "\nCI-Regeln: 1) Nutze ```tool``` exklusiv für Workspace-Suche/Read (niemals in ```python```). "
+            "2) Liefere Unified Diffs als EINEN ```diff```-Block. "
+            "3) Gib ```python``` NUR aus, wenn du tatsächlich Code/Tests schreibst und direkt ausführst. "
+            "4) Wenn eine Suche 2× hintereinander keine Treffer liefert, fasse knapp zusammen und frage gezielt nach Pfaden/Dateien.\n"
+        )
+
+    messages: List[Dict[str, Any]] = [
+        {"role":"system","content": system_prompt},
+        {"role":"user","content": task}
+    ]
+
+    session_start = time.time()
+
+    consecutive_nohit = 0
+
+    def trim_history_if_needed():
+        total = sum(len(m.get("content","")) for m in messages)
+        while total > max_history_chars and len(messages) > 2:
+            del messages[2:4]
+            total = sum(len(m.get("content","")) for m in messages)
+
+    step_idx = 0
+
+    for step in range(1, max_steps+1):
+        trim_history_if_needed()
+        step_idx = step
+
+        # Antwort holen (Streaming/Nicht-Streaming)
+        content: Optional[str] = None
+        if not no_stream:
+            streamed = chat_stream(model, messages, temperature, max_tokens, connect_timeout, read_timeout, logfile)
+            if streamed is not None:
+                content = streamed
+        if content is None:
+            resp = chat_non_stream(model, messages, temperature, max_tokens, connect_timeout, read_timeout, logfile, fallback_model)
+            content = resp["choices"][0]["message"]["content"]
+            print(f"\n[ASSISTENT {step}] --------------------\n{content}\n")
+        else:
+            print(f"[ASSISTENT {step}] (gestreamt) --------------------\n")
+
+        messages.append({"role":"assistant","content": content or ""})
+        log_line(logfile, f"ASSISTENT[{step}] len={len(content or '')}")
+
+        # Früher Bootstrap, wenn noch gar kein Tool genutzt wurde
+        if args.bootstrap_missing_target and tool_calls_total == 0 and step >= max(1, int(args.bootstrap_after_steps)):
+            target_dir = os.path.join(workspace, "agent_bootstrap")
+            os.makedirs(target_dir, exist_ok=True)
+            buggy = os.path.join(target_dir, "bug_target.py")
+            testsf = os.path.join(target_dir, "test_bug_target.py")
+            if not os.path.exists(buggy):
+                open(buggy,"w",encoding="utf-8").write(
+                    "def parse_cfg(text):\\n"
+                    "    out = {}\\n"
+                    "    for line in text.splitlines():\\n"
+                    "        # BUG: crasht bei Leerzeilen (split auf \\\"\\\")\\n"
+                    "        key, val = line.split('=', 1)\\n"
+                    "        out[key.strip()] = val.strip()\\n"
+                    "    return out\\n"
+                )
+                open(testsf,"w",encoding="utf-8").write(
+                    "import unittest\\nfrom agent_bootstrap.bug_target import parse_cfg\\n\\n"
+                    "class TestBugTarget(unittest.TestCase):\\n"
+                    "    def test_empty_lines(self):\\n"
+                    "        cfg = 'a=1\\n\\n b=2\\n'\\n"
+                    "        self.assertEqual(parse_cfg(cfg), {'a':'1','b':'2'})\\n\\n"
+                    "if __name__ == '__main__':\\n    unittest.main(verbosity=2)\\n"
+                )
+                print(badge("BOOT", f"Bootstrap-Ziel (früh) erzeugt unter {target_dir}"))
+                did_bootstrap = True
+
+                globals()['did_bootstrap'] = True
+                messages.append({"role":"user","content":
+                    "Bootstrap aktiviert (früh): Erzeuge EINEN ```diff```-Block (Unified Diff), "
+                    "der agent_bootstrap/bug_target.py robust gegen Leerzeilen macht (Leer-/Whitespace-Zeilen und Zeilen ohne '=' überspringen). "
+                    "Führe anschließend die Tests in agent_bootstrap/test_bug_target.py aus und berichte kompakt (RC, Ran, OK/FAILED)."
+                })
+                continue
+        # 1) Tool-Autodetektion vor Diff/Python (robust, auch wenn falsch gefenced)
+        tdata = try_extract_tool_json(content or "")
+        if tdata:
+            # Wiederhol-Schutz: identische Tool-Calls höchstens 2x in Folge
+            last_two = [m for m in messages[-4:] if m.get("role")=="assistant"]
+            same_count = 0
+            for lm in reversed(last_two):
+                td_prev = try_extract_tool_json(lm.get("content") or "")
+                if td_prev == tdata:
+                    same_count += 1
+                else:
+                    break
+            if same_count > 1:
+                messages.append({"role":"user","content":
+                    "Du hast denselben Tool-Aufruf bereits mehrmals ausgeführt. Ändere Query/Path sinnvoll oder fahre mit einem Unified Diff fort, falls du genug Kontext hast."
+                })
+                continue
+            result_tool = handle_tool_block(json.dumps(tdata), workspace, logfile)
+            print("\n[TOOL-ERGEBNIS] --------------------")
+            print(shorten(result_tool, 1600))
+            print("--------------------\n")
+            messages.append({"role":"user","content": f"Tool-Ausgabe:\n{shorten(result_tool,1600)}\nFahre fort."})
+            continue
+        # Gate: diff erst zulassen, wenn Tool genutzt ODER Bootstrap erfolgt ist
+        if args.require_tool_first and (tool_calls_total == 0 and not did_bootstrap):
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Bevor du Code oder Diff lieferst: führe eine gezielte Workspace-Suche per ```tool``` "
+                    "aus (z. B. nach parse/reader/config) und/oder lies relevante Dateien."
+                ),
+            })
+            continue
+
+        # 2) Unified Diff?
+        if have_unified_diff(content or ""):
+            diff_text = extract_unified_diff(content or "")
+            if not diff_text:
+                messages.append({"role":"user","content":
+                    "Der Diff-Block wurde nicht erkannt. Gib bitte GENAU EINEN ```diff```-Block mit Unified Diff (---/+++/@@) aus."
+                })
+                continue
+            ok, msg = apply_unified_diff(diff_text, workspace, artifacts, logfile, dry_run=dry_run_patch)
+            if ok:
+                print(badge("PATCH", "OK: " + msg))
+                diffs_applied += 1
+            else:
+                print(badge("PATCH", "FEHLER: " + msg))
+                diffs_failed += 1
+            if ok:
+                messages.append({"role":"user","content":
+                    ("Patch DRY-RUN erfolgreich." if dry_run_patch else "Patch erfolgreich angewendet.")
+                    + " Führe nun die relevanten Tests aus und bestätige kurz die Resultate."
+                })
+            else:
+                messages.append({"role":"user","content":
+                    f"Patch-Anwendung fehlgeschlagen:\n{shorten(msg)}\nErzeuge einen **korrigierten** Unified Diff als EINEN ```diff```-Block."
+                })
+                continue
+        # 3) Python-Codeblock – genau einer, sauber
+        code, reason = extract_clean_python_block(content or "")
+        if code is None:
+            if not args.no_auto_continue:
+                messages.append({"role":"user","content":
+                    "Kein gültiger einzelner ```python```-Block erkannt (" + (reason or "Unbekannter Grund") + "). "
+                    "Gib JETZT AUSSCHLIESSLICH EINEN ```python```-Block ohne Meta-/HTML-Tags aus "
+                    "(Implementierung + MINIMALE Tests + kurzer Testrun)."
+                })
+                continue
+            else:
+                nxt = input("Kein gültiger einzelner Codeblock. Weiter iterieren? [y/N]: ").strip().lower()
+                if nxt != "y": break
+                else: continue
+
+        print("[EXEC] Führe Python-Code aus...")
+        result = run_python(code, workspace, artifacts, exec_timeout, cpu_seconds, mem_limit, no_network, logfile, step_idx, tests)
+        print_exec_summary(result)
+        code_runs += 1
+        _out = (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
+        m_ran = re.search(r"Ran\s+(\d+)\s+tests?", _out)
+        if m_ran:
+            try: tests_ran = int(m_ran.group(1))
+            except: pass
+        if "OK" in _out and "FAILED" not in _out:
+            tests_ok = True
+        elif "FAILED" in _out or "ERROR" in _out:
+            tests_ok = False
+        # 4) Fail-fast / Auto-Retry
+        retries_left = max(0, int(retries))
+        if is_failure(result) and retries_left > 0:
+            used_retries += 1
+            out = shorten((result.get("stdout") or ""))
+            err = shorten((result.get("stderr") or ""))
+            messages.append({"role":"user","content":
+                f"Ausführung FEHLGESCHLAGEN. RC: {result['returncode']}, Dauer: {result['duration_sec']}s\n"
+                f"STDOUT:\n{out}\nSTDERR:\n{err}\n"
+                "Erzeuge einen MINIMALEN Patch als EINEN ```python```-Block (inkl. Tests) und führe die Tests am Ende aus."
+            })
+            while retries_left > 0:
+                retries_left -= 1
+                trim_history_if_needed()
+                content_retry: Optional[str] = None
+                if not no_stream:
+                    sr = chat_stream(model, messages, max(0.1, temperature*0.8), max_tokens, connect_timeout, read_timeout, logfile)
+                    if sr is not None: content_retry = sr
+                if content_retry is None:
+                    resp2 = chat_non_stream(model, messages, max(0.1, temperature*0.8), max_tokens, connect_timeout, read_timeout, logfile, fallback_model)
+                    content_retry = resp2["choices"][0]["message"]["content"]
+                    print(f"\n[ASSISTENT Retry] --------------------\n{content_retry}\n")
+                else:
+                    print(f"[ASSISTENT Retry] (gestreamt) --------------------\n")
+                messages.append({"role":"assistant","content": content_retry})
+                log_line(logfile, f"ASSISTENT[Retry] len={len(content_retry or '')}")
+
+                code2, reason2 = extract_clean_python_block(content_retry or "")
+                if code2 is None:
+                    messages.append({"role":"user","content":
+                        "Es fehlt ein gültiger einzelner ```python```-Block (" + (reason2 or "Unbekannter Grund") + "). "
+                        "Gib GENAU EINEN Block mit korrigierter Implementierung + Tests + Testrun (ohne Meta-/HTML-Tags)."
+                    })
+                    continue
+                print("[EXEC] Führe Python-Code (Retry) aus...")
+                result2 = run_python(code2, workspace, artifacts, exec_timeout, cpu_seconds, mem_limit, no_network, logfile, step_idx, tests)
+                print_exec_summary(result2)
+                code_runs += 1
+                if not is_failure(result2):
+                    messages.append({"role":"user","content":
+                        "Jetzt erfolgreich. Fasse die Lösung abschließend in 3–5 prägnanten Bullet Points zusammen."
+                    })
+                    break
+                else:
+                    if retries_left == 0:
+                        messages.append({"role":"user","content":
+                            "Weiterhin fehlgeschlagen. Beende mit einer knappen Fehleranalyse (max. 5 Bullet Points)."
+                        })
+                    else:
+                        messages.append({"role":"user","content":
+                            "Fehler bestehen weiterhin. Erzeuge einen NOCH kleineren Patch als EINEN ```python```-Block."
+                        })
+        else:
+            out = shorten((result.get("stdout") or ""))
+            err = shorten((result.get("stderr") or ""))
+            session_ok = bool(result.get("ok", False))
+            messages.append({"role":"user","content":
+                f"Ausführung {'OK' if result.get('ok') else 'NICHT OK'}. RC: {result['returncode']}, Dauer: {result['duration_sec']}s\n"
+                f"STDOUT:\n{out}\nSTDERR:\n{err}\n"
+                "Wenn gelöst, liefere eine knappe Abschlusszusammenfassung und ggf. minimalen Patch/Diff."
+            })
+
+    # --- final metrics -> globals() for atexit reporter ---
+
+
+    try:
+
+        g = globals()
+
+        # Werte aus main() in module-level spiegeln
+
+        g['session_ok']       = bool(session_ok)
+
+        g['used_retries']     = int(used_retries)
+
+        g['tool_calls_total'] = int(tool_calls_total)
+
+        g['search_total']     = int(search_total)
+
+        g['read_total']       = int(read_total)
+
+        g['diffs_applied']    = int(diffs_applied)
+
+        g['diffs_failed']     = int(diffs_failed)
+
+        g['code_runs']        = int(code_runs)
+
+        g['tests_ran']        = int(tests_ran or 0)
+
+        g['tests_ok']         = bool(tests_ok) if tests_ok is not None else False
+
+        g['did_bootstrap']    = bool(did_bootstrap)
+
+        try:
+
+            ctx = g.setdefault('__glm_exit_ctx', {})
+
+            ctx.update({
+
+                'session_ok': g['session_ok'],
+
+                'used_retries': g['used_retries'],
+
+                'tool_calls_total': g['tool_calls_total'],
+
+                'search_total': g['search_total'],
+
+                'read_total': g['read_total'],
+
+                'diffs_applied': g['diffs_applied'],
+
+                'diffs_failed': g['diffs_failed'],
+
+                'code_runs': g['code_runs'],
+
+                'tests_ran': g['tests_ran'],
+
+                'tests_ok': g['tests_ok'],
+
+                'did_bootstrap': g['did_bootstrap'],
+
+            })
+
+        except Exception:
+
+            pass
+
+    except Exception:
+
+        # Reporting darf den Exit nie brechen
+
+        pass
+
+if __name__ == "__main__":
+    main()
+
+
+# === JSON report on exit (single, canonical) ===
+import atexit, time, os, json
+
+def __glm_emit_json_report():
+    try:
+        g = globals()
+        args = g.get("args", None)
+
+        # [AUTO] derive counters from log (always)
+
+        try:
+
+            logfile = getattr(args, 'logfile', None) if 'args' in locals() else None
+
+        except Exception:
+
+            logfile = None
+
+        tc, st, rt = (0,0,0)
+
+        if logfile:
+
+            try:
+
+                tc, st, rt = __glm_count_tools_from_log(logfile)
+
+            except Exception:
+
+                pass
+
+        # Spiegeln in ctx und globals, damit Payload unten konsistent ist
+
+        try:
+
+            ctx['tool_calls_total'] = tc; ctx['search_total'] = st; ctx['read_total'] = rt
+
+        except Exception:
+
+            pass
+
+        try:
+
+            g = globals() if 'g' not in locals() else g
+
+            g['tool_calls_total'] = tc; g['search_total'] = st; g['read_total'] = rt
+
+        except Exception:
+
+            pass
+
+        # Nur im CI-Modus reporten
+        if not args or not getattr(args, "ci", False):
+            return
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        artifacts = os.path.expanduser("~/.glm-agent/artifacts")
+        os.makedirs(artifacts, exist_ok=True)
+        json_path = os.path.join(artifacts, f"report_{ts}.json")
+
+        def gint(name, default=0):
+            try:
+                return int(g.get(name, default) or 0)
+            except Exception:
+                return default
+        def gbool(name, default=False):
+            return bool(g.get(name, default))
+
+        payload = {
+            "ok":            gbool("session_ok", False),
+            "used_retries":  gint("used_retries", 0),
+            "tool_calls_total": gint("tool_calls_total", 0),
+            "search_total":  gint("search_total", 0),
+            "read_total":    gint("read_total", 0),
+            "diffs_applied": gint("diffs_applied", 0),
+            "diffs_failed":  gint("diffs_failed", 0),
+            "code_runs":     gint("code_runs", 0),
+            "tests_ran":     gint("tests_ran", 0),
+            "tests_ok":      gbool("tests_ok", False),
+            "bootstrapped":  gbool("did_bootstrap", False),
+            "timestamp":     ts,
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[OK] JSON-Report geschrieben: {json_path}")
+    except Exception:
+        # Report darf den Exit niemals brechen
+        pass
+
+atexit.register(__glm_emit_json_report)
+
+# [AUTO] tool counter helper (always-from-log)
+# [AUTO] tool counter helper (always-from-log, tolerant)
+def __glm_count_tools_from_log(log_path: str):
+    try:
+        import re
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            ss = f.read()
+    except Exception:
+        return 0, 0, 0
+
+    # Primär: invoked-Marker (ohne Zeilenanfang-Anker → Zeitstempel egal)
+    search_inv = len(re.findall(r'\[TOOL\][ \t]+search invoked', ss))
+    read_inv   = len(re.findall(r'\[TOOL\][ \t]+read invoked',   ss))
+
+    # Fallback/Ergänzung: returned-Marker
+    search_ret = len(re.findall(r'\[TOOL\][ \t]+SEARCH-ERGEBNIS returned', ss))
+    read_ret   = len(re.findall(r'\[TOOL\][ \t]+READ-ERGEBNIS returned',   ss))
+
+    search_hits = max(search_inv, search_ret)
+    read_hits   = max(read_inv,   read_ret)
+    total = search_hits + read_hits
+    return total, search_hits, read_hits

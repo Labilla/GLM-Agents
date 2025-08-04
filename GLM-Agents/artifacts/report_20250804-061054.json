@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "used_retries": 0,
+  "tool_calls_total": 0,
+  "search_total": 0,
+  "read_total": 0,
+  "diffs_applied": 0,
+  "diffs_failed": 0,
+  "code_runs": 0,
+  "tests_ran": 0,
+  "tests_ok": false,
+  "bootstrapped": false,
+  "timestamp": "20250804-061054"
+}

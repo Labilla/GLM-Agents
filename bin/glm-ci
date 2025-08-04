@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+echo "▶ Starte CI…"
+glm-agent --ci --force-clone --require-tool-first \
+  --bootstrap-missing-target --bootstrap-after-steps 2 --tests auto \
+  --workspace "$HOME/dev/myproj" \
+  --git https://github.com/pypa/sampleproject.git \
+  --artifacts "$HOME/.glm-agent/artifacts" \
+  --json-report auto \
+  --logfile "$HOME/.glm-agent/agent.log"
+glm-status
