@@ -1,0 +1,187 @@
+*** Begin Patch
+*** Add File: .gitignore
++__pycache__/
++*.py[cod]
++*.pyo
++venv/
++.env
++.glm-agent/
++*.bak
++*.log
++artifacts/
+
+*** Add File: requirements.txt
++httpx>=0.24
++textual>=0.43
++pytest>=8.0
++rich>=13.0
+
+*** Add File: adds/__init__.py
++\"\"\" 
++adds
++====
++
++Paket-Basis für das Autonome Digital Brain Assistant Entwicklungssystem (ADDS).
++\"\"\"
+
+*** Add File: adds/task_graph.py
++\"\"\" 
++task_graph
++==========
++
++Definiert Task und TaskGraph mit Zyklus-Erkennung.
++\"\"\"
++
++from typing import Dict, List
++
++class Task:
++    def __init__(self, task_id: str, goal: str, assigned_to: str, depends_on: List[str] = None):
++        self.task_id = task_id
++        self.goal = goal
++        self.assigned_to = assigned_to
++        self.depends_on = depends_on or []
++
++class TaskGraph:
++    def __init__(self):
++        self.tasks: Dict[str, Task] = {}
++
++    def add_task(self, task: Task):
++        self.tasks[task.task_id] = task
++
++    def has_cycle(self) -> bool:
++        visited = {}
++        def visit(n):
++            if visited.get(n) == 'temp': return True
++            if visited.get(n) == 'perm': return False
++            visited[n] = 'temp'
++            for m in self.tasks[n].depends_on:
++                if visit(m): return True
++            visited[n] = 'perm'
++            return False
++        return any(visit(n) for n in self.tasks)
+
+*** Add File: adds/orchestrator.py
++\"\"\" 
++orchestrator
++============
++
++MetaAgent: Anfrage → Ressourcen-Schätzung + Makro-HTDAG.
++\"\"\"
++
++from typing import Dict, Any
++from adds.task_graph import Task, TaskGraph
++
++class MetaAgent:
++    def handle_request(self, goal: str) -> Dict[str, Any]:
++        resources = {
++            \"gpu_vram_gb_peak\":\"low\",
++            \"system_ram_gb_peak\":\"low\",
++            \"estimated_compute_minutes\":\"low\"
++        }
++        tg = TaskGraph()
++        tg.add_task(Task(\"ARCH-001\", f\"Analysiere und implementiere: {goal}\", \"ArchitectAgent\"))
++        tg.add_task(Task(\"VAL-001\", \"Validiere das Ergebnis von ARCH-001\", \"ValidatorAgent\", [\"ARCH-001\"]))
++        return {
++            \"resource_prediction\": resources,
++            \"htdag\": {\"tasks\": {tid: vars(t) for tid,t in tg.tasks.items()}}
++        }
+
+*** Add File: adds/architect_agent.py
++\"\"\" 
++architect_agent
++===============
++
++Stub für den Architekt-Agenten.
++\"\"\"
++class ArchitectAgent:
++    def plan(self, spec: str):
++        raise NotImplementedError
+
+*** Add File: adds/validator_agent.py
++\"\"\" 
++validator_agent
++===============
++
++Stub für den Validator-Agenten.
++\"\"\"
++class ValidatorAgent:
++    def validate(self, data):
++        raise NotImplementedError
+
+*** Add File: adds/ethics_agent.py
++\"\"\" 
++ethics_agent
++============
++
++Stub für den Ethiker-Agenten.
++\"\"\"
++class EthicsAgent:
++    def audit(self, artifact):
++        raise NotImplementedError
+
+*** Add File: adds/ux_agent.py
++\"\"\" 
++ux_agent
++========
++
++Stub für den UX-Agenten.
++\"\"\"
++class UXAgent:
++    def evaluate(self, component):
++        raise NotImplementedError
+
+*** Add File: adds/cli.py
++#!/usr/bin/env python3
++\"\"\" 
++adds_cli
++========
++
++Kommandozeilen-Frontend für MetaAgent.
++\"\"\"
++
++import os, sys, json
++try:
++    from adds.orchestrator import MetaAgent
++except ImportError:
++    root = os.path.dirname(os.path.dirname(__file__))
++    sys.path.insert(0, root)
++    from adds.orchestrator import MetaAgent
++
++def main():
++    args = sys.argv[1:]
++    if not args:
++        print(\"Usage: adds_cli.py \\\"<goal>\\\"\", file=sys.stderr)
++        return 1
++    goal = \" \".join(args)
++    resp = MetaAgent().handle_request(goal)
++    print(json.dumps(resp, indent=2, ensure_ascii=False))
++    return 0
++
++if __name__ == \"__main__\":
++    sys.exit(main())
+
+*** Add File: tests/test_adds.py
++\"\"\" 
++Tests für das adds-Paket.
++\"\"\"
++
++from adds.task_graph import Task, TaskGraph
++from adds.orchestrator import MetaAgent
++
++def test_taskgraph_cycle():
++    tg = TaskGraph()
++    tg.add_task(Task(\"A\",\"a\",\"X\"))
++    tg.add_task(Task(\"B\",\"b\",\"Y\",[\"A\"]))
++    assert not tg.has_cycle()
++
++def test_taskgraph_cycle_detected():
++    tg = TaskGraph()
++    tg.add_task(Task(\"A\",\"a\",\"X\",[\"B\"]))
++    tg.add_task(Task(\"B\",\"b\",\"Y\",[\"A\"]))
++    assert tg.has_cycle()
++
++def test_metaagent_cli():
++    resp = MetaAgent().handle_request(\"Testgoal\")
++    assert \"resource_prediction\" in resp
++    assert \"htdag\" in resp
+*** End Patch
